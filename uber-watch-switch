@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""Uber Watch model switcher: lists the models you can load, stops the loaded one cleanly, loads another.
+
+  uber-watch-switch list [--json]      the models (Strata presets + your own entries), and which is loaded
+  uber-watch-switch status [--json]    what is loaded now, and the progress of a switch
+  uber-watch-switch switch <id>        stop the loaded model, then load <id> (id as shown by `list`)
+  uber-watch-switch stop               stop the loaded model (the watchdog is paused, like the tray's Unload)
+  uber-watch-switch agents [--json]    how many agent sessions use the model now (they lose it when it is switched away)
+
+Only one large model fits in memory at a time, so a switch always stops the old model first and waits until
+its processes are gone before it starts the new one. Progress is written to ~/.local/state/strata/switch.json
+(state: idle | stopping | loading | ready | failed) for the tray icon and the game mode panel to show.
+
+Where the list comes from (nothing is hard-coded):
+  * every Strata preset (`strata launch --list-presets`), minus the names in ~/.config/uber-watch/hidden-models
+  * every ~/.config/uber-watch/models.d/*.json, for models that Strata does not start. One file per model
+    ("label" is optional: without it the list shows the name the model's server reports, once it has been loaded):
+      {"id": "ltx", "label": "LTX video", "start": ["/path/to/start"], "stop": ["/path/to/stop"],
+       "ready_url": "http://127.0.0.1:8188/", "ready_timeout": 600}
+    Optional: "label_from" (a file pattern: the label is the name of the first file it finds, e.g. the model file),
+    "open_url" (a page to open in your browser once it is ready), "note" (shown with the model, e.g. what happens on first use).
+    "start" runs detached; "stop" ends it (if missing, the process group of "start" is ended);
+    "ready_url" (optional) is polled until it answers; without it the model counts as loaded once "start" is running.
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STRATA = os.path.join(HOME, ".local/bin/strata")
+STATE_DIR = os.path.join(HOME, ".local/state/strata")
+SWITCH = os.path.join(STATE_DIR, "switch.json")        # progress of the current / last switch
+ACTIVE = os.path.join(STATE_DIR, "active-model")       # what the watchdog should keep up (json)
+SWITCHING = os.path.join(STATE_DIR, "switching")       # exists while a switch runs: the watchdog idles
+PAUSED = os.path.join(STATE_DIR, "paused")
+TRAY_STATE = os.path.join(STATE_DIR, "tray-state.json")
+LOCK = os.path.join(STATE_DIR, "switch.lock")
+LOG = os.path.join(STATE_DIR, "watchdog.log")
+LOAD_LOG = os.path.join(STATE_DIR, "switch-load.log")
+CONF_DIR = os.path.join(HOME, ".config/uber-watch")
+MODELS_D = os.path.join(CONF_DIR, "models.d")
+HIDDEN = os.path.join(CONF_DIR, "hidden-models")
+KEY_FILE = os.path.join(HOME, ".config/strata/api-key")
+UNIT = "strata-watchdog.service"
+# the engine processes `strata launch` starts (the classic engine and the shape engines such as inkling)
+ENGINE_RE = r"\.local/share/strata/components/.*(engine|shapes)/[^ ]*/strata[a-z0-9-]* --serve"
+STOP_WAIT = 90        # seconds for the old model's processes to go
+LOAD_TIMEOUT = 900    # seconds for the new model to answer
+
+
+def log(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%F %T") + " switch: " + msg + "\n")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def touch(path, on):
+    if on:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "a").close()
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+# ---------- the model list ----------
+def ctx_label(n):
+    return f"{n // 1024}K" if isinstance(n, int) and n >= 1024 else ""
+
+
+NAMES = os.path.join(HOME, ".cache/uber-watch/model-names.json")   # preset -> {"key": settings it was read for, "name": ...}
+
+
+def real_name(preset, settings):
+    """The model's own name as Strata reports it (`strata launch --plan`), e.g. 'Swift 1.5 IQ2_XS'. Cached per preset
+    and re-read when the preset's settings change."""
+    cache = read_json(NAMES, {})
+    key = json.dumps(settings, sort_keys=True)
+    hit = cache.get(preset)
+    if hit and hit.get("key") == key and hit.get("name"):
+        return hit["name"]
+    try:
+        out = subprocess.run([STRATA, "launch", "--preset", preset, "--plan"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"^\s*model\s+(.+?)(?:,\s*[\d.]+\s*[KMGT]B)?\s*$", out, re.M)
+    if not m:
+        return None
+    cache[preset] = {"key": key, "name": m.group(1).strip()}
+    write_json(NAMES, cache)
+    return cache[preset]["name"]
+
+
+def strata_models():
+    try:
+        out = subprocess.run([STRATA, "launch", "--list-presets", "--output", "json"], capture_output=True, text=True, timeout=30).stdout
+        presets = json.loads(out).get("presets", [])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    hidden = set()
+    try:
+        with open(HIDDEN) as f:
+            hidden = {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except OSError:
+        pass
+    models = []
+    for p in presets:
+        name = p.get("name", "")
+        if not name or name in hidden:
+            continue
+        paths = [d for d in (p.get("data_dir"), p.get("model_path")) if d]
+        ok = all(os.path.exists(d) for d in paths)
+        models.append({
+            "id": "strata:" + name, "kind": "strata", "preset": name,
+            "label": real_name(name, {k: p.get(k) for k in ("family", "model", "model_path", "data_dir")}) or name, "detail": "",
+            "available": ok, "why": "" if ok else "model files not found",
+        })
+    names = [m["label"] for m in models]
+    for m in models:  # two presets of one model: tell them apart by the preset name
+        if names.count(m["label"]) > 1:
+            m["label"] += f" ({m['preset']})"
+    return models
+
+
+def file_label(pattern):
+    """The name (without extension) of the first file matching the pattern: the model's own file name."""
+    for f in sorted(glob.glob(os.path.expanduser(pattern or ""))):
+        name = os.path.basename(f)
+        return name.rsplit(".", 1)[0] if "." in name else name
+    return None
+
+
+def custom_models():
+    models = []
+    for path in sorted(glob.glob(os.path.join(MODELS_D, "*.json"))):
+        d = read_json(path, None)
+        if not isinstance(d, dict) or not d.get("id") or not d.get("start"):
+            continue
+        exe = d["start"][0]
+        ok = os.path.exists(exe) or any(os.path.exists(os.path.join(p, exe)) for p in os.environ.get("PATH", "").split(":"))
+        models.append({
+            "id": "cmd:" + d["id"], "kind": "command", "label": d.get("label") or file_label(d.get("label_from")) or read_json(NAMES, {}).get("cmd:" + d["id"], {}).get("name") or d["id"],
+            "detail": d.get("detail", ""), "open_url": d.get("open_url"), "note": d.get("note", ""),
+            "start": d["start"], "stop": d.get("stop"), "ready_url": d.get("ready_url"),
+            "ready_timeout": int(d.get("ready_timeout", LOAD_TIMEOUT)),
+            "available": ok, "why": "" if ok else "start command not found",
+        })
+    return models
+
+
+def all_models():
+    return strata_models() + custom_models()
+
+
+# ---------- what is loaded ----------
+def api_key():
+    try:
+        with open(KEY_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def url_answers(url, timeout=6):
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + api_key()})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status < 500
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def served_model(url):
+    """(name, loaded) from the server's model list."""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/v1/models", headers={"Authorization": "Bearer " + api_key()})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode()).get("data") or []
+        if d:
+            return d[0].get("id", ""), (d[0].get("status") or {}).get("value") == "loaded"
+    except Exception:  # noqa: BLE001
+        pass
+    return "", False
+
+
+def strata_status():
+    """(preset, url) of what `strata launch` runs, or (None, None)."""
+    try:
+        out = subprocess.run([STRATA, "launch", "--status"], capture_output=True, text=True, timeout=20).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    line = out.splitlines()[0] if out else ""
+    if ":" in line and "Nothing" not in line:
+        name, rest = line.split(":", 1)
+        m = re.search(r"(https?://\S+)", rest)
+        return name.strip(), (m.group(1) if m else None)
+    return None, None
+
+
+def engine_pids():
+    r = subprocess.run(["pgrep", "-f", ENGINE_RE], capture_output=True, text=True)
+    return [int(p) for p in r.stdout.split()]
+
+
+def current():
+    """What is loaded now: {'id','label','url','ready'} or None."""
+    act = read_json(ACTIVE, {})
+    if act.get("kind") == "command":
+        ready = url_answers(act["ready_url"]) if act.get("ready_url") else bool(act.get("pid") and os.path.exists(f"/proc/{act['pid']}"))
+        if ready:
+            return {"id": act["id"], "label": act.get("label", act["id"]), "url": act.get("ready_url"), "ready": True,
+                    "note": act.get("note", "")}
+    preset, url = strata_status()
+    if preset:
+        _, loaded = served_model(url) if url else ("", False)
+        return {"id": "strata:" + preset, "label": preset, "url": url, "ready": loaded}
+    return None
+
+
+# ---------- progress ----------
+class Progress:
+    def __init__(self, target, label):
+        self.d = {"state": "idle", "target": target, "label": label, "message": "", "started": time.time(),
+                  "updated": time.time(), "pid": os.getpid()}
+
+    def set(self, state=None, message=None):
+        if state:
+            self.d["state"] = state
+        if message is not None:
+            self.d["message"] = message
+        self.d["updated"] = time.time()
+        write_json(SWITCH, self.d)
+
+
+def switch_info():
+    d = read_json(SWITCH, {"state": "idle"})
+    if d.get("state") in ("stopping", "loading"):
+        pid = d.get("pid")
+        if not pid or not os.path.exists(f"/proc/{pid}"):  # the switch process died: do not show it as running forever
+            d["state"] = "failed"
+            d["message"] = "The switch was interrupted."
+    return d
+
+
+# ---------- stop / start ----------
+def end_processes(pids, patience):
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    end = time.time() + patience
+    while time.time() < end:
+        if not any(os.path.exists(f"/proc/{p}") for p in pids):
+            return True
+        time.sleep(1)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(2)
+    return not any(os.path.exists(f"/proc/{p}") for p in pids)
+
+
+def stop_current(prog):
+    """Stops whatever is loaded and waits until it is gone. Raises RuntimeError if it will not go."""
+    act = read_json(ACTIVE, {})
+    if act.get("kind") == "command":
+        prog.set(message=f"Stopping {act.get('label', act['id'])}...")
+        if act.get("stop"):
+            subprocess.run(act["stop"], capture_output=True, timeout=120)
+        elif act.get("pid"):
+            try:
+                os.killpg(os.getpgid(act["pid"]), signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(2)
+        pid = act.get("pid")
+        if pid and os.path.exists(f"/proc/{pid}"):
+            end_processes([pid], 30)
+    preset, _ = strata_status()
+    if preset:
+        prog.set(message=f"Stopping {preset}...")
+        subprocess.run(["timeout", "60", STRATA, "launch", "--stop", "--preset", preset], capture_output=True)
+    pids = engine_pids()
+    if pids:
+        prog.set(message="Waiting for the old model to release memory...")
+        if not end_processes(pids, STOP_WAIT):
+            raise RuntimeError("The old model would not stop.")
+    if engine_pids():
+        raise RuntimeError("The old model would not stop.")
+
+
+def tail_line(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 3000))
+            lines = [ln.strip() for ln in f.read().decode(errors="replace").splitlines() if ln.strip()]
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", lines[-1])[:100] if lines else ""
+    except OSError:
+        return ""
+
+
+def load_strata(m, prog):
+    prog.set("loading", f"Loading {m['preset']}...")
+    start = time.time()
+    with open(LOAD_LOG, "w") as lf:
+        proc = subprocess.Popen([STRATA, "launch", "--preset", m["preset"], "--tune", "skip", "--no-tui", "--yes"],
+                                stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    while proc.poll() is None:
+        if time.time() - start > LOAD_TIMEOUT:
+            os.killpg(proc.pid, signal.SIGTERM)
+            raise RuntimeError(f"Loading took longer than {LOAD_TIMEOUT // 60} minutes.")
+        line = tail_line(LOAD_LOG)
+        prog.set(message=f"Loading {m['preset']} ({int(time.time() - start)} s)" + (f": {line}" if line else ""))
+        time.sleep(3)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Loading failed (exit {proc.returncode}): {tail_line(LOAD_LOG)}")
+    preset, url = strata_status()
+    if preset != m["preset"] or not url:
+        raise RuntimeError("Strata reports a different model than the one asked for.")
+    prog.set(message="Waiting for the server to answer...")
+    end = time.time() + 180
+    name = ""
+    while time.time() < end:
+        name, loaded = served_model(url)
+        if loaded:
+            return {"id": m["id"], "kind": "strata", "preset": preset, "label": m["label"], "url": url, "model": name}
+        time.sleep(3)
+    raise RuntimeError("The model loaded but the server does not answer.")
+
+
+def load_command(m, prog):
+    prog.set("loading", f"Starting {m['label']}...")
+    proc = subprocess.Popen(m["start"], stdout=open(LOAD_LOG, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    start = time.time()
+    while True:
+        if proc.poll() not in (None, 0):
+            raise RuntimeError(f"Start failed (exit {proc.returncode}): {tail_line(LOAD_LOG)}")
+        if m.get("ready_url"):
+            if url_answers(m["ready_url"]):
+                break
+        elif proc.poll() is None and time.time() - start > 3:
+            break
+        elif proc.poll() == 0:
+            break
+        if time.time() - start > m["ready_timeout"]:
+            os.killpg(proc.pid, signal.SIGTERM)
+            raise RuntimeError("It did not become ready in time.")
+        prog.set(message=f"Starting {m['label']} ({int(time.time() - start)} s)")
+        time.sleep(3)
+    if m.get("ready_url"):  # remember the name the server itself reports, so the list shows it from now on
+        name, _ = served_model(m["ready_url"])
+        if name:
+            cache = read_json(NAMES, {})
+            cache[m["id"]] = {"name": name}
+            write_json(NAMES, cache)
+            m["label"] = name
+    return {"id": m["id"], "kind": "command", "label": m["label"], "url": m.get("ready_url"), "pid": proc.pid,
+            "ready_url": m.get("ready_url"), "stop": m.get("stop"), "note": m.get("note", "")}
+
+
+# ---------- commands ----------
+def do_switch(target):
+    models = {m["id"]: m for m in all_models()}
+    m = models.get(target) or models.get("strata:" + target) or models.get("cmd:" + target)
+    if not m:
+        print(f"No such model: {target}", file=sys.stderr)
+        return 2
+    if not m["available"]:
+        print(f"{m['label']} cannot be loaded: {m['why']}", file=sys.stderr)
+        return 2
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("A switch is already running.", file=sys.stderr)
+        return 3
+    prog = Progress(m["id"], m["label"])
+    st = read_json(TRAY_STATE, {})
+    was_paused = os.path.exists(PAUSED)
+    touch(SWITCHING, True)  # the watchdog idles: it must not load the old model back while this runs
+    log(f"switching to {m['id']}")
+    try:
+        prog.set("stopping", "Stopping the loaded model...")
+        stop_current(prog)
+        info = load_strata(m, prog) if m["kind"] == "strata" else load_command(m, prog)
+        write_json(ACTIVE, info)
+        st.update(last_preset=info.get("preset") or st.get("last_preset"), last_model=info["id"])
+        if st.get("paused_by_unload"):
+            touch(PAUSED, False)
+            st["paused_by_unload"] = False
+        write_json(TRAY_STATE, st)
+        prog.set("ready", f"{m['label']} is loaded." + (f" {m['note']}" if m.get("note") else ""))
+        log(f"{m['id']} is loaded")
+        if m.get("open_url"):
+            try:
+                subprocess.Popen(["xdg-open", m["open_url"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                pass
+        return 0
+    except Exception as e:  # noqa: BLE001
+        # nothing is loaded now: pause the watchdog the way Unload does, so Reload (or another switch) resumes it
+        st.update(paused_by_unload=not was_paused or st.get("paused_by_unload", False))
+        write_json(TRAY_STATE, st)
+        touch(PAUSED, True)
+        prog.set("failed", str(e))
+        log(f"switch to {m['id']} failed: {e}")
+        return 1
+    finally:
+        touch(SWITCHING, False)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def do_stop():
+    prog = Progress("", "")
+    was_on = not os.path.exists(PAUSED)
+    touch(PAUSED, True)
+    st = read_json(TRAY_STATE, {})
+    cur = current()
+    st.update(paused_by_unload=was_on or st.get("paused_by_unload", False))
+    if cur and cur["id"].startswith("strata:"):
+        st["last_preset"] = cur["id"][7:]
+    write_json(TRAY_STATE, st)
+    try:
+        stop_current(prog)
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 1
+    write_json(ACTIVE, {})
+    return 0
+
+
+def agent_count():
+    """How many agent sessions are running (processes named in ~/.config/uber-watch/agent-processes, default: pi)."""
+    names = ["pi"]
+    try:
+        with open(os.path.join(CONF_DIR, "agent-processes")) as f:
+            names = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")] or names
+    except OSError:
+        pass
+    n = 0
+    for nm in names:
+        r = subprocess.run(["pgrep", "-x", nm], capture_output=True, text=True)
+        n += len(r.stdout.split())
+    return n
+
+
+def view():
+    cur = current()
+    return {"current": cur, "switch": switch_info(), "models": all_models(), "agents": agent_count()}
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "list"
+    js = "--json" in argv
+    if cmd == "list":
+        v = view()
+        if js:
+            print(json.dumps(v))
+        else:
+            cid = v["current"]["id"] if v["current"] else None
+            for m in v["models"]:
+                mark = "*" if m["id"] == cid else " "
+                print(f"{mark} {m['id']:<32} {m['label']}  {m['detail']}" + ("" if m["available"] else f"  [{m['why']}]"))
+        return 0
+    if cmd == "status":
+        v = view()
+        v.pop("models")
+        if js:
+            print(json.dumps(v))
+        else:
+            c, s = v["current"], v["switch"]
+            print("loaded: " + (f"{c['label']} ({'ready' if c['ready'] else 'not answering'})" if c else "nothing"))
+            print(f"switch: {s.get('state')} {s.get('message', '')}")
+        return 0
+    if cmd == "switch" and len(argv) > 2:
+        return do_switch(argv[2])
+    if cmd == "stop":
+        return do_stop()
+    if cmd == "agents":
+        n = agent_count()
+        print(json.dumps({"count": n}) if js else n)
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

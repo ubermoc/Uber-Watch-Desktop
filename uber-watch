@@ -28,14 +28,30 @@ deep_ok() {  # a one-token answer comes back (proves the GPU still works)
     2>/dev/null | grep -q '"choices"'
 }
 
+# The model switcher (uber-watch-switch) writes active-model: the model the person chose last. Follow it, so a restart
+# loads that model and not the one from the settings. While a switch runs ("switching" file) nothing is checked or loaded.
+ACTIVE="$HOME/.local/state/strata/active-model"
+SWITCHING="$HOME/.local/state/strata/switching"
+ACTIVE_KIND=strata
+follow_active() {
+  [ -s "$ACTIVE" ] || return 0
+  local kind p u m
+  kind=$(jq -r '.kind // ""' "$ACTIVE" 2>/dev/null)
+  if [ "$kind" = command ]; then ACTIVE_KIND=command; return 0; fi   # a model Strata does not start: not this script's job
+  ACTIVE_KIND=strata
+  p=$(jq -r '.preset // ""' "$ACTIVE" 2>/dev/null); u=$(jq -r '.url // ""' "$ACTIVE" 2>/dev/null); m=$(jq -r '.model // ""' "$ACTIVE" 2>/dev/null)
+  [ -n "$p" ] && PRESET="$p"; [ -n "$u" ] && URL="$u"; [ -n "$m" ] && MODEL="$m"
+  return 0
+}
+
 restart_model() {
   log "restarting: stopping the old process"
   timeout 60 "$STRATA" launch --stop --preset "$PRESET" >>"$LOG" 2>&1 || true
   sleep 3
   # a hung engine can ignore the stop: end only the engine process, matched by exact name
-  pkill -TERM -f 'components/engine/[^ ]*/strata --serve' 2>/dev/null || true
+  pkill -TERM -f 'components/.*(engine|shapes)/[^ ]*/strata[a-z0-9-]* --serve' 2>/dev/null || true
   sleep 5
-  pkill -KILL -f 'components/engine/[^ ]*/strata --serve' 2>/dev/null || true
+  pkill -KILL -f 'components/.*(engine|shapes)/[^ ]*/strata[a-z0-9-]* --serve' 2>/dev/null || true
   log "restarting: starting preset $PRESET"
   timeout 600 "$STRATA" launch --preset "$PRESET" --tune skip --no-tui --yes >>"$LOG" 2>&1
   log "restart command finished (exit $?)"
@@ -133,6 +149,15 @@ fails=0
 restarts=()
 last_check=$(date '+%F %T')
 log "watchdog started (preset $PRESET, $URL)"
+# a model Strata does not start (for example a video tool) is a use for one stretch: after a reboot or a crash of it, go back
+# to the default model, so forget the choice when that model is not running now
+if [ -s "$ACTIVE" ] && [ "$(jq -r '.kind // ""' "$ACTIVE" 2>/dev/null)" = command ]; then
+  ru=$(jq -r '.ready_url // ""' "$ACTIVE" 2>/dev/null); ap=$(jq -r '.pid // 0' "$ACTIVE" 2>/dev/null)
+  if { [ -n "$ru" ] && ! curl -fsS -m 5 -o /dev/null "$ru" 2>/dev/null; } || { [ -z "$ru" ] && [ ! -d "/proc/$ap" ]; }; then
+    log "the chosen model ($(jq -r '.id' "$ACTIVE")) is not running: going back to the default ($PRESET)"
+    rm -f "$ACTIVE"
+  fi
+fi
 # after a reboot, a logout or a restart of this service: continue what was cut off (up to 6 hours back)
 if [ -e "$PAUSED" ]; then log "paused (paused file): staying idle until resumed"; elif healthy; then resume_interrupted $(( $(date +%s) - 21600 )) "$NO_RESUME_BOOT"; fi
 for u in $WATCHED_UNITS; do unit_seen[$u]=$(unit_stamp "$u"); done
@@ -140,6 +165,9 @@ for u in $WATCHED_UNITS; do unit_seen[$u]=$(unit_stamp "$u"); done
 while true; do
   sleep "$INTERVAL"
   if [ -e "$PAUSED" ]; then fails=0; continue; fi   # paused: check nothing, load nothing
+  if [ -e "$SWITCHING" ] && [ $(( $(date +%s) - $(stat -c %Y "$SWITCHING") )) -lt 2400 ]; then fails=0; continue; fi  # a model switch is running
+  follow_active
+  if [ "$ACTIVE_KIND" = command ]; then fails=0; continue; fi   # the chosen model is not a Strata one
   now=$(date +%s)
   watch_units
 
