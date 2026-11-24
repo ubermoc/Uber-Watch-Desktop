@@ -1,0 +1,13 @@
+[Unit]
+Description=Uber Watch (keeps the local model up)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/uber-watch
+KillMode=process
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

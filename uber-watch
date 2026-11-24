@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Uber Watch: keeps the local model up. Reloads it if it stops answering (for example after a GPU reset),
+# then continues the agent sessions that were cut off. Runs as a systemd --user service (strata-watchdog.service).
+# Log: ~/.local/state/strata/watchdog.log
+set -u
+PRESET="${STRATA_PRESET:?set STRATA_PRESET (the Strata preset to keep loaded)}"
+URL="${STRATA_URL:-http://127.0.0.1:8081}"
+MODEL="${STRATA_MODEL:?set STRATA_MODEL (the model name the server reports)}"
+STRATA="$HOME/.local/bin/strata"
+LOG="$HOME/.local/state/strata/watchdog.log"
+INTERVAL=20          # seconds between checks
+FAILS_NEEDED=3       # consecutive failed checks before a restart (about 60 s)
+LOAD_GRACE=240       # seconds to let a fresh start load the model
+MAX_RESTARTS=5       # per hour; after that it stops restarting and only logs
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+api_key() { cat "$HOME/.config/strata/api-key" 2>/dev/null; }  # the key is read each time, so a new key needs no restart of this script
+
+healthy() {  # the server answers its model list
+  curl -fsS -m 8 -H "Authorization: Bearer $(api_key)" "$URL/v1/models" 2>/dev/null | jq -e '.data[0].status.value == "loaded"' >/dev/null 2>&1
+}
+
+deep_ok() {  # a one-token answer comes back (proves the GPU still works)
+  curl -fsS -m 90 "$URL/v1/chat/completions" -H "Authorization: Bearer $(api_key)" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" \
+    2>/dev/null | grep -q '"choices"'
+}
+
+restart_model() {
+  log "restarting: stopping the old process"
+  timeout 60 "$STRATA" launch --stop --preset "$PRESET" >>"$LOG" 2>&1 || true
+  sleep 3
+  # a hung engine can ignore the stop: end only the engine process, matched by exact name
+  pkill -TERM -f 'components/engine/[^ ]*/strata --serve' 2>/dev/null || true
+  sleep 5
+  pkill -KILL -f 'components/engine/[^ ]*/strata --serve' 2>/dev/null || true
+  log "restarting: starting preset $PRESET"
+  timeout 600 "$STRATA" launch --preset "$PRESET" --tune skip --no-tui --yes >>"$LOG" 2>&1
+  log "restart command finished (exit $?)"
+}
+
+PI="$HOME/.local/bin/pi"
+SESSIONS="$HOME/.pi/agent/sessions"
+RESUME_WINDOW=3600   # only sessions touched in the hour before the outage
+RESUME_TIMEOUT=3600  # a resumed session gets at most this long
+RESUME_LOGS="$HOME/.local/state/strata/resume"
+NO_RESUME="$HOME/.local/state/strata/no-resume"   # this file exists = never resume sessions by itself (tray toggle)
+mkdir -p "$RESUME_LOGS"
+
+# Is an interactive Pi still open in this folder? (then the person can type "continue" there)
+pi_open_in() {
+  local pid
+  for pid in $(pgrep -x pi 2>/dev/null); do
+    [ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# true when the session's last message is not a finished assistant answer (stopReason "stop")
+session_unfinished() {
+  local f="$1" last role stop
+  last=$(jq -c 'select(.type == "message") | {r: .message.role, s: (.message.stopReason // "")}' "$f" 2>/dev/null | tail -1)
+  role=$(jq -r '.r' <<<"$last" 2>/dev/null); stop=$(jq -r '.s' <<<"$last" 2>/dev/null)
+  [ -n "$role" ] || return 1
+  if [ "$role" = assistant ] && [ "$stop" = stop ]; then return 1; fi
+  return 0
+}
+
+# After the model is back: resume every Pi session whose last turn was cut off.
+# "Cut off" = the last message is not a finished assistant answer (stopReason "stop").
+resume_interrupted() {
+  local since="$1" f cwd last
+  [ -x "$PI" ] || return 0
+  if [ -e "$NO_RESUME" ]; then log "resume: switched off (no-resume file), leaving sessions alone"; return 0; fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    cwd=$(jq -r 'select(.cwd != null) | .cwd' "$f" 2>/dev/null | head -1)
+    [ -n "$cwd" ] && [ -d "$cwd" ] || { log "resume: skipping $(basename "$f") (no usable working folder)"; continue; }
+    session_unfinished "$f" || continue                                # finished turn: nothing to resume
+    last=$(jq -c 'select(.type == "message") | {r: .message.role, s: (.message.stopReason // "")}' "$f" 2>/dev/null | tail -1)
+    # the person pressed Esc ("aborted"): a deliberate stop, never resumed
+    [ "$(jq -r '.s' <<<"$last")" = aborted ] && continue
+    # already being continued, or continued in the last 10 minutes (stops a loop on a session that keeps failing)
+    pgrep -f -- "--session $f" >/dev/null 2>&1 && continue
+    rl="$RESUME_LOGS/$(basename "$f" .jsonl).log"
+    [ -e "$rl" ] && [ $(( $(date +%s) - $(stat -c %Y "$rl") )) -lt 600 ] && continue
+    if pi_open_in "$cwd"; then
+      log "resume: $(basename "$f") is still open in a Pi in $cwd; type 'continue' there"
+      command -v notify-send >/dev/null && timeout 5 notify-send "Strata is back" "Type 'continue' in your Pi session in $cwd" 2>/dev/null
+      continue
+    fi
+    log "resume: continuing $(basename "$f") in $cwd (last message: $(jq -r '.r + "/" + .s' <<<"$last"))"
+    # Pi takes a session by file path and does not ask before every tool call, so there is no approval flag to pass.
+    ( cd "$cwd" && timeout "$RESUME_TIMEOUT" "$PI" --session "$f" -p "continue" \
+        >"$RESUME_LOGS/$(basename "$f" .jsonl).log" 2>&1
+      log "resume: $(basename "$f") finished (exit $?)" ) &
+  done < <(find "$SESSIONS" -name '*.jsonl' -newermt "@$since" 2>/dev/null)
+}
+
+# Services that must stay up. systemd restarts them after a crash (Restart=on-failure); this starts one that
+# is stopped, and tells when the agent supervisor came back so the cut-off agent sessions can be continued.
+WATCHED_UNITS="${UBER_WATCH_UNITS:-}"   # space-separated systemd user services to keep up (optional)
+declare -A unit_seen
+unit_stamp() { systemctl --user show "$1.service" -p ActiveEnterTimestampMonotonic --value 2>/dev/null; }
+watch_units() {
+  local u st
+  for u in $WATCHED_UNITS; do
+    if ! systemctl --user is-active --quiet "$u.service"; then
+      case "$(systemctl --user is-enabled "$u.service" 2>/dev/null)" in
+        enabled)
+          log "unit $u is not running: starting it"
+          systemctl --user start "$u.service" >>"$LOG" 2>&1 || log "unit $u: start failed" ;;
+      esac
+      continue
+    fi
+    st=$(unit_stamp "$u")
+    if [ -n "${unit_seen[$u]:-}" ] && [ "${unit_seen[$u]}" != "$st" ]; then
+      log "unit $u came back (it had stopped or crashed)"
+      sleep 20; resume_interrupted $(( $(date +%s) - RESUME_WINDOW ))
+    fi
+    unit_seen[$u]="$st"
+  done
+}
+
+# (for the offline test: load the functions above and stop before the loop)
+if [ "${WATCHDOG_SOURCE_ONLY:-}" = 1 ]; then return 0; fi
+
+fails=0
+restarts=()
+last_check=$(date '+%F %T')
+log "watchdog started (preset $PRESET, $URL)"
+# after a reboot, a logout or a restart of this service: continue what was cut off (up to 6 hours back)
+if healthy; then resume_interrupted $(( $(date +%s) - 21600 )); fi
+for u in $WATCHED_UNITS; do unit_seen[$u]=$(unit_stamp "$u"); done
+
+while true; do
+  sleep "$INTERVAL"
+  now=$(date +%s)
+  watch_units
+
+  # a GPU reset in the kernel log since the last pass triggers a deeper check
+  reset_seen=0
+  if journalctl -k --no-pager --since "$last_check" 2>/dev/null | grep -qiE 'amdgpu.*(GPU reset begin|GPU reset\([0-9]+\) (succeeded|failed)|ring .* timeout)'; then
+    reset_seen=1
+    log "kernel reported a GPU reset"
+  fi
+  last_check=$(date '+%F %T')
+
+  ok=1
+  if ! healthy; then
+    ok=0
+  elif [ "$reset_seen" = 1 ] && ! deep_ok; then
+    log "model is up but does not answer after the GPU reset"
+    ok=0
+  fi
+
+  if [ "$ok" = 1 ]; then fails=0; continue; fi
+
+  fails=$((fails + 1))
+  log "check failed ($fails of $FAILS_NEEDED)"
+  # after a reset, do not wait for three failures
+  if [ "$fails" -lt "$FAILS_NEEDED" ] && [ "$reset_seen" = 0 ]; then continue; fi
+
+  # limit restarts to MAX_RESTARTS per hour
+  recent=()
+  for t in "${restarts[@]:-}"; do [ -n "$t" ] && [ $((now - t)) -lt 3600 ] && recent+=("$t"); done
+  restarts=("${recent[@]:-}")
+  if [ "${#recent[@]}" -ge "$MAX_RESTARTS" ]; then
+    log "giving up for now: $MAX_RESTARTS restarts in the last hour"
+    sleep 600; fails=0; continue
+  fi
+
+  restarts+=("$now")
+  restart_model
+  fails=0
+  # wait (up to LOAD_GRACE) for the model to answer, then resume cut-off sessions
+  waited=0
+  until healthy || [ "$waited" -ge "$LOAD_GRACE" ]; do sleep 5; waited=$((waited + 5)); done
+  last_check=$(date '+%F %T')
+  if healthy; then
+    log "model is back"
+    resume_interrupted $((now - RESUME_WINDOW))
+  else
+    log "model is still not answering after the restart"
+  fi
+done
