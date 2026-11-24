@@ -19,13 +19,15 @@ UNIT = "strata-watchdog.service"
 STRATA = os.path.expanduser("~/.local/bin/strata")
 LOG = os.path.expanduser("~/.local/state/strata/watchdog.log")
 STATE = os.path.expanduser("~/.local/state/strata/tray-state.json")
-NO_RESUME = os.path.expanduser("~/.local/state/strata/no-resume")  # the watchdog skips resuming sessions while this exists
+NO_RESUME = os.path.expanduser("~/.local/state/strata/no-resume")  # exists = no resume after a model restart or a crash
+NO_RESUME_BOOT = os.path.expanduser("~/.local/state/strata/no-resume-reboot")  # exists = no resume after a reboot or a restart of the watchdog
 DESC = {
     "Pause Uber Watch": "Stops watching. The model keeps running.",
     "Resume Uber Watch": "Watches again and continues cut-off sessions.",
     "Unload model": "Frees memory and pauses Uber Watch.",
     "Reload model": "Loads the last model; resumes Uber Watch if Unload paused it.",
-    "Don't resume sessions by itself": "On: cut-off sessions stay stopped until you continue them.",
+    "Don't resume after a reboot": "On: after a reboot or logout, sessions stay stopped until you continue them.",
+    "Don't resume cut-off sessions": "On: after a model restart or a crash, cut-off sessions stay stopped.",
 }
 ICONS = {"on": "media-playback-start", "paused": "media-playback-pause"}
 
@@ -103,10 +105,8 @@ class Tray:
         m.append(Gtk.SeparatorMenuItem())
         self.pause_it = self.item(m, "Pause Uber Watch", self.pause)
         self.resume_it = self.item(m, "Resume Uber Watch", self.resume)
-        self.noresume_it = Gtk.CheckMenuItem(label="Don't resume sessions by itself   —   " + DESC["Don't resume sessions by itself"])
-        self.noresume_it.set_active(os.path.exists(NO_RESUME))
-        self.noresume_it.connect("toggled", lambda w: self.toggle_noresume(w.get_active()))
-        m.append(self.noresume_it)
+        self.noboot_it = self.switch(m, "Don't resume after a reboot", NO_RESUME_BOOT)
+        self.nocut_it = self.switch(m, "Don't resume cut-off sessions", NO_RESUME)
         m.append(Gtk.SeparatorMenuItem())
         self.unload_it = self.item(m, "Unload model", self.unload)
         self.reload_it = self.item(m, "Reload model", self.reload)
@@ -125,6 +125,21 @@ class Tray:
         it.set_sensitive(False)
         menu.append(it)
         return it
+
+    def switch(self, menu, text, flag):
+        it = Gtk.CheckMenuItem(label=text + "   —   " + DESC[text])
+        it.set_active(os.path.exists(flag))
+        it.connect("toggled", lambda w: self.set_flag(flag, w.get_active()))
+        menu.append(it)
+        return it
+
+    @staticmethod
+    def set_flag(flag, on):
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        if on:
+            open(flag, "w").close()
+        elif os.path.exists(flag):
+            os.remove(flag)
 
     @staticmethod
     def item(menu, text, cb):
@@ -166,15 +181,6 @@ class Tray:
         save_state(paused_by_unload=False)
         say("Watchdog is watching again.")
         self.refresh()
-
-    def toggle_noresume(self, on):
-        os.makedirs(os.path.dirname(NO_RESUME), exist_ok=True)
-        if on:
-            open(NO_RESUME, "w").close()
-            say("Sessions will not be resumed by the watchdog.")
-        elif os.path.exists(NO_RESUME):
-            os.remove(NO_RESUME)
-            say("The watchdog resumes cut-off sessions again.")
 
     def run_async(self, work):
         self.busy = True
