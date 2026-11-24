@@ -18,7 +18,9 @@ Where the list comes from (nothing is hard-coded):
       {"id": "ltx", "label": "LTX video", "start": ["/path/to/start"], "stop": ["/path/to/stop"],
        "ready_url": "http://127.0.0.1:8188/", "ready_timeout": 600}
     Optional: "label_from" (a file pattern: the label is the name of the first file it finds, e.g. the model file),
-    "open_url" (a page to open in your browser once it is ready), "note" (shown with the model, e.g. what happens on first use).
+    "open_url" (a page to open in your browser once it is ready), "note" (shown with the model, e.g. what happens on first use),
+    "server" (a name: entries with the same name are models of one running server, e.g. several models in one ComfyUI;
+    switching between them keeps the server running instead of stopping and starting it).
     "start" runs detached; "stop" ends it (if missing, the process group of "start" is ended);
     "ready_url" (optional) is polled until it answers; without it the model counts as loaded once "start" is running.
 """
@@ -163,7 +165,7 @@ def custom_models():
         ok = os.path.exists(exe) or any(os.path.exists(os.path.join(p, exe)) for p in os.environ.get("PATH", "").split(":"))
         models.append({
             "id": "cmd:" + d["id"], "kind": "command", "label": d.get("label") or file_label(d.get("label_from")) or read_json(NAMES, {}).get("cmd:" + d["id"], {}).get("name") or d["id"],
-            "detail": d.get("detail", ""), "open_url": d.get("open_url"), "note": d.get("note", ""),
+            "detail": d.get("detail", ""), "open_url": d.get("open_url"), "note": d.get("note", ""), "server": d.get("server"),
             "start": d["start"], "stop": d.get("stop"), "ready_url": d.get("ready_url"),
             "ready_timeout": int(d.get("ready_timeout", LOAD_TIMEOUT)),
             "available": ok, "why": "" if ok else "start command not found",
@@ -302,6 +304,9 @@ def stop_current(prog):
         pid = act.get("pid")
         if pid and os.path.exists(f"/proc/{pid}"):
             end_processes([pid], 30)
+        lp = listener_pid(act.get("ready_url"))      # whatever still holds the port (a server we did not start ourselves)
+        if lp:
+            end_processes([lp], 30)
     preset, _ = strata_status()
     if preset:
         prog.set(message=f"Stopping {preset}...")
@@ -355,7 +360,23 @@ def load_strata(m, prog):
     raise RuntimeError("The model loaded but the server does not answer.")
 
 
+def listener_pid(url):
+    """The process that listens on the port of `url` (None if nothing does or it cannot be read)."""
+    m = re.search(r":(\d+)", url or "")
+    if not m:
+        return None
+    out = subprocess.run(["ss", "-ltnpH", f"sport = :{m.group(1)}"], capture_output=True, text=True).stdout
+    p = re.search(r"pid=(\d+)", out)
+    return int(p.group(1)) if p else None
+
+
 def load_command(m, prog):
+    if m.get("ready_url") and url_answers(m["ready_url"]):
+        # already running (started by hand or by another program): use it as it is and stop it later by its port
+        prog.set("loading", f"{m['label']} is already running.")
+        return {"id": m["id"], "kind": "command", "label": m["label"], "url": m.get("ready_url"), "pid": listener_pid(m["ready_url"]),
+                "ready_url": m.get("ready_url"), "stop": m.get("stop"), "note": m.get("note", ""), "server": m.get("server"),
+                "adopted": True}
     prog.set("loading", f"Starting {m['label']}...")
     proc = subprocess.Popen(m["start"], stdout=open(LOAD_LOG, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                             start_new_session=True)
@@ -383,7 +404,7 @@ def load_command(m, prog):
             write_json(NAMES, cache)
             m["label"] = name
     return {"id": m["id"], "kind": "command", "label": m["label"], "url": m.get("ready_url"), "pid": proc.pid,
-            "ready_url": m.get("ready_url"), "stop": m.get("stop"), "note": m.get("note", "")}
+            "ready_url": m.get("ready_url"), "stop": m.get("stop"), "note": m.get("note", ""), "server": m.get("server")}
 
 
 # ---------- commands ----------
@@ -409,6 +430,14 @@ def do_switch(target):
     touch(SWITCHING, True)  # the watchdog idles: it must not load the old model back while this runs
     log(f"switching to {m['id']}")
     try:
+        act = read_json(ACTIVE, {})
+        if m["kind"] == "command" and m.get("server") and act.get("kind") == "command" and act.get("server") == m["server"] \
+                and current() and current().get("ready"):
+            # another model of the server that is already running: nothing to stop or start
+            write_json(ACTIVE, {**act, "id": m["id"], "label": m["label"], "note": m.get("note", ""), "open_url": m.get("open_url")})
+            prog.set("ready", f"{m['label']} is available in the running {m['server']}." + (f" {m['note']}" if m.get("note") else ""))
+            log(f"{m['id']}: same server ({m['server']}) is running, kept")
+            return 0   # its page is already open: it is not opened again
         prog.set("stopping", "Stopping the loaded model...")
         stop_current(prog)
         info = load_strata(m, prog) if m["kind"] == "strata" else load_command(m, prog)
