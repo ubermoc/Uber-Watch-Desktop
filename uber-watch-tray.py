@@ -95,14 +95,19 @@ class Tray:
         self.log_label = self.label(m)
         m.append(Gtk.SeparatorMenuItem())
         self.pause_it = self.item(m, "Pause Uber Watch", self.pause)
+        self.note(m, "Stops watching. The model keeps running.")
         self.resume_it = self.item(m, "Resume Uber Watch", self.resume)
+        self.note(m, "Watches again and continues cut-off sessions.")
         self.noresume_it = Gtk.CheckMenuItem(label="Don't resume sessions by itself")
         self.noresume_it.set_active(os.path.exists(NO_RESUME))
         self.noresume_it.connect("toggled", lambda w: self.toggle_noresume(w.get_active()))
         m.append(self.noresume_it)
+        self.note(m, "On: cut-off sessions stay stopped until you continue them.")
         m.append(Gtk.SeparatorMenuItem())
         self.unload_it = self.item(m, "Unload model", self.unload)
+        self.note(m, "Frees memory and pauses Uber Watch.")
         self.reload_it = self.item(m, "Reload model", self.reload)
+        self.note(m, "Loads the last model; resumes Uber Watch if Unload paused it.")
         m.append(Gtk.SeparatorMenuItem())
         self.item(m, "Close this icon", Gtk.main_quit)
         m.show_all()
@@ -115,6 +120,13 @@ class Tray:
     @staticmethod
     def label(menu):
         it = Gtk.MenuItem(label="")
+        it.set_sensitive(False)
+        menu.append(it)
+        return it
+
+    @staticmethod
+    def note(menu, text):
+        it = Gtk.MenuItem(label="    " + text)  # a greyed line under the option it explains
         it.set_sensitive(False)
         menu.append(it)
         return it
