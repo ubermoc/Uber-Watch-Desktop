@@ -4,6 +4,7 @@
 Menu: Pause / Resume; Unload model (also pauses the watchdog, or it would load the model
 again); Reload model (loads the preset that was loaded last, and resumes the watchdog if Unload paused it).
 """
+import fcntl
 import json
 import os
 import signal
@@ -242,7 +243,19 @@ class Tray:
         self.run_async(work)
 
 
+def single_instance():
+    """Only one tray icon at a time: a second copy exits at once (the lock goes away with the process)."""
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    lock = open(os.path.join(os.path.dirname(STATE), "tray.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(0)
+    return lock
+
+
 if __name__ == "__main__":
+    _lock = single_instance()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     Tray()
     Gtk.main()
