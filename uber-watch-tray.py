@@ -19,10 +19,11 @@ UNIT = "strata-watchdog.service"
 STRATA = os.path.expanduser("~/.local/bin/strata")
 LOG = os.path.expanduser("~/.local/state/strata/watchdog.log")
 STATE = os.path.expanduser("~/.local/state/strata/tray-state.json")
+PAUSED = os.path.expanduser("~/.local/state/strata/paused")  # exists = paused: the watchdog idles, across reboots and mode switches
 NO_RESUME = os.path.expanduser("~/.local/state/strata/no-resume")  # exists = no resume after a model restart or a crash
 NO_RESUME_BOOT = os.path.expanduser("~/.local/state/strata/no-resume-reboot")  # exists = no resume after a reboot or a restart of the watchdog
 DESC = {
-    "Pause Uber Watch": "Stops watching. The model keeps running.",
+    "Pause Uber Watch": "Stops watching, even after a reboot or a mode switch, until you resume. The model keeps running.",
     "Resume Uber Watch": "Watches again and continues cut-off sessions.",
     "Unload model": "Frees memory and pauses Uber Watch.",
     "Reload model": "Loads the last model; resumes Uber Watch if Unload paused it.",
@@ -37,7 +38,15 @@ def sc(*args):
 
 
 def watching():
-    return sc("is-active", UNIT).stdout.strip() == "active"
+    return sc("is-active", UNIT).stdout.strip() == "active" and not os.path.exists(PAUSED)
+
+
+def set_paused(on):
+    os.makedirs(os.path.dirname(PAUSED), exist_ok=True)
+    if on:
+        open(PAUSED, "w").close()
+    elif os.path.exists(PAUSED):
+        os.remove(PAUSED)
 
 
 def load_state():
@@ -171,13 +180,14 @@ class Tray:
         return True
 
     def pause(self):
-        sc("stop", UNIT)
+        set_paused(True)
         save_state(paused_by_unload=False)
         say("Watchdog paused. The model keeps running.")
         self.refresh()
 
     def resume(self):
-        sc("start", UNIT)
+        set_paused(False)
+        sc("start", UNIT)  # in case the service itself was stopped
         save_state(paused_by_unload=False)
         say("Watchdog is watching again.")
         self.refresh()
@@ -200,7 +210,7 @@ class Tray:
 
         def work():
             was_on = watching()
-            sc("stop", UNIT)  # first: a running watchdog would load the model again
+            set_paused(True)  # first: a running watchdog would load the model again (the pause lasts across reboots and mode switches)
             save_state(last_preset=preset, paused_by_unload=was_on)
             subprocess.run(["timeout", "60", STRATA, "launch", "--stop"] + (["--preset", preset] if preset else []),
                            capture_output=True)
@@ -223,6 +233,7 @@ class Tray:
                 say(f"Loading {preset} failed (exit {r.returncode}). Watchdog left as it is.")
                 return
             if load_state().get("paused_by_unload"):
+                set_paused(False)
                 sc("start", UNIT)
                 save_state(paused_by_unload=False)
                 say(f"{preset} is loaded. Watchdog is watching again.")

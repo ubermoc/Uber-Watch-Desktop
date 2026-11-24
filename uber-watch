@@ -47,6 +47,7 @@ RESUME_WINDOW=3600   # only sessions touched in the hour before the outage
 RESUME_TIMEOUT=3600  # a resumed session gets at most this long
 RESUME_LOGS="$HOME/.local/state/strata/resume"
 NO_RESUME="$HOME/.local/state/strata/no-resume"                 # exists = do not continue cut-off sessions after a model restart or a service crash (switch)
+PAUSED="$HOME/.local/state/strata/paused"                       # exists = Uber Watch is paused: it idles and loads nothing, across reboots and mode switches
 NO_RESUME_BOOT="$HOME/.local/state/strata/no-resume-reboot"     # exists = do not continue sessions at start-up (reboot, logout, restart of this service) (switch)
 mkdir -p "$RESUME_LOGS"
 
@@ -133,11 +134,12 @@ restarts=()
 last_check=$(date '+%F %T')
 log "watchdog started (preset $PRESET, $URL)"
 # after a reboot, a logout or a restart of this service: continue what was cut off (up to 6 hours back)
-if healthy; then resume_interrupted $(( $(date +%s) - 21600 )) "$NO_RESUME_BOOT"; fi
+if [ -e "$PAUSED" ]; then log "paused (paused file): staying idle until resumed"; elif healthy; then resume_interrupted $(( $(date +%s) - 21600 )) "$NO_RESUME_BOOT"; fi
 for u in $WATCHED_UNITS; do unit_seen[$u]=$(unit_stamp "$u"); done
 
 while true; do
   sleep "$INTERVAL"
+  if [ -e "$PAUSED" ]; then fails=0; continue; fi   # paused: check nothing, load nothing
   now=$(date +%s)
   watch_units
 

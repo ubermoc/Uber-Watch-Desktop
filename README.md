@@ -20,7 +20,7 @@ Built for the Strata local model server on Linux. Works with any setup where the
 
 | Option | What it does |
 |---|---|
-| Pause Uber Watch | Stops watching. The model keeps running, but nothing restarts it if it fails. |
+| Pause Uber Watch | Stops watching, even after a reboot or a mode switch, until you resume. The model keeps running, but nothing restarts it if it fails. |
 | Resume Uber Watch | Starts watching again: restarts the model if it fails and continues cut-off sessions. |
 | Don't resume after a reboot | On: after a reboot or logout, sessions stay stopped until you continue them. |
 | Don't resume cut-off sessions | On: after a model restart or a crash, cut-off sessions stay stopped. |
@@ -49,6 +49,7 @@ The tray icon needs `python-gobject` and `libayatana-appindicator`. It starts at
 |---|---|
 | `~/.local/state/strata/watchdog.log` | what the watchdog did |
 | `~/.local/state/strata/tray-state.json` | the last loaded preset (shared with the game mode panel) |
+| `~/.local/state/strata/paused` | exists = paused: the watchdog idles and loads nothing, across reboots and mode switches (shared by the tray and the panel) |
 | `~/.local/state/strata/no-resume` | exists = do not continue cut-off sessions after a model restart or a crash |
 | `~/.local/state/strata/no-resume-reboot` | exists = do not continue sessions after a reboot, a logout or a restart of the watchdog |
 
