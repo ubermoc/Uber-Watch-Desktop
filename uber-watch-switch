@@ -239,7 +239,14 @@ def current():
     if preset:
         _, loaded = served_model(url) if url else ("", False)
         return {"id": "strata:" + preset, "label": preset, "url": url, "ready": loaded}
+    for m in running_commands():      # started by hand, not through the switcher: still the loaded model
+        return {"id": m["id"], "label": m["label"], "url": m["ready_url"], "ready": True, "note": m.get("note", "")}
     return None
+
+
+def running_commands():
+    """Command models (models.d entries with a ready_url) whose server answers now, however they were started."""
+    return [m for m in custom_models() if m["kind"] == "command" and m.get("ready_url") and url_answers(m["ready_url"], 3)]
 
 
 # ---------- progress ----------
@@ -307,6 +314,11 @@ def stop_current(prog):
         lp = listener_pid(act.get("ready_url"))      # whatever still holds the port (a server we did not start ourselves)
         if lp:
             end_processes([lp], 30)
+    for m in running_commands():      # one that was started by hand is not in ACTIVE: stop it with its own stop command
+        if m["id"] != "cmd:" + str(act.get("id", "")).removeprefix("cmd:") and m.get("stop"):
+            prog.set(message=f"Stopping {m['label']}...")
+            subprocess.run(m["stop"], capture_output=True, timeout=120)
+            time.sleep(2)
     preset, _ = strata_status()
     if preset:
         prog.set(message=f"Stopping {preset}...")
